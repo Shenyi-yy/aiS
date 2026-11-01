@@ -1,0 +1,14 @@
+# 统一换行符为 LF, 解决 Windows 开发 / Ubuntu 部署的 CRLF 问题
+* text=auto eol=lf
+
+*.yml    text eol=lf
+*.yaml   text eol=lf
+*.sh     text eol=lf
+*.py     text eol=lf
+*.env.example text eol=lf
+Dockerfile text eol=lf
+
+# 二进制文件不做转换
+*.png binary
+*.jpg binary
+*.gz binary

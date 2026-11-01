@@ -1,0 +1,170 @@
+# =============================================================
+# Phase 1: Zabbix (Server/Web/DB/Agent) + FastAPI backend
+# 运行位置: Ubuntu 服务器 (docker compose -p zops up -d)
+# 镜像版本: Zabbix 7.0 LTS (ubuntu 变体)
+# =============================================================
+
+name: zops
+
+services:
+  # ---------- Zabbix 数据库 (PostgreSQL) ----------
+  postgres:
+    image: postgres:16-alpine
+    container_name: zops-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-zabbix}
+      POSTGRES_PASSWORD: ${ZABBIX_DB_PASSWORD:?ZABBIX_DB_PASSWORD 未设置，请复制 .env.example 为 .env 并修改}
+      POSTGRES_DB: ${POSTGRES_DB:-zabbix}
+    volumes:
+      - zabbix_pg_data:/var/lib/postgresql/data
+    networks:
+      - zops-net
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-zabbix} -d ${POSTGRES_DB:-zabbix}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+  # ---------- Zabbix Server ----------
+  zabbix-server:
+    image: zabbix/zabbix-server-pgsql:7.0-ubuntu-latest
+    container_name: zops-zabbix-server
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DB_SERVER_HOST: postgres
+      POSTGRES_USER: ${POSTGRES_USER:-zabbix}
+      POSTGRES_DB: ${POSTGRES_DB:-zabbix}
+      # 注意: Zabbix 7.0 入口脚本只读 POSTGRES_PASSWORD (不认 ZABBIX_DB_PASS)
+      POSTGRES_PASSWORD: ${ZABBIX_DB_PASSWORD:?ZABBIX_DB_PASSWORD 未设置}
+    volumes:
+      # 保留 server 的可写数据目录（告警脚本、外部脚本等）
+      - zabbix_server_data:/var/lib/zabbix
+    networks:
+      - zops-net
+    # Phase 2: 宿主机原生 zabbix-agent2 的 Active check 走宿主机 IP:10051, 需要把端口发布出来
+    ports:
+      - "${ZBX_SERVER_PORT:-10051}:10051"
+    # 简易健康检查: 10051 端口可连通即视为健康
+    healthcheck:
+      test: ["CMD-SHELL", "bash -c 'echo > /dev/tcp/127.0.0.1/10051' || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 60s
+
+  # ---------- Zabbix Web (Nginx + PHP) ----------
+  zabbix-web:
+    image: zabbix/zabbix-web-nginx-pgsql:7.0-ubuntu-latest
+    container_name: zops-zabbix-web
+    restart: unless-stopped
+    depends_on:
+      zabbix-server:
+        condition: service_started
+    environment:
+      ZABBIX_SERVER_HOST: zabbix-server
+      ZABBIX_SERVER_PORT: "10051"
+      PHP_TZ: Asia/Shanghai
+      # Web 入口脚本同样要直连数据库生成前端配置 (7.0 只认 POSTGRES_PASSWORD)
+      DB_SERVER_HOST: postgres
+      POSTGRES_USER: ${POSTGRES_USER:-zabbix}
+      POSTGRES_DB: ${POSTGRES_DB:-zabbix}
+      POSTGRES_PASSWORD: ${ZABBIX_DB_PASSWORD:?ZABBIX_DB_PASSWORD 未设置}
+    ports:
+      - "${ZABBIX_WEB_PORT:-8080}:8080"
+    networks:
+      - zops-net
+
+  # ---------- Zabbix Agent (被 Server 采集, passive 模式) ----------
+  zabbix-agent:
+    image: zabbix/zabbix-agent:7.0-ubuntu-latest
+    container_name: zops-zabbix-agent
+    restart: unless-stopped
+    depends_on:
+      zabbix-server:
+        condition: service_started
+    environment:
+      # 必须与 Web 页面中 Host name 一致, 否则 server 找不到主机数据
+      ZBX_HOSTNAME: zabbix-agent
+      # 注意: 该变量会同时写入 Server= 和 ServerActive=, 不能填 CIDR (ServerActive 不支持)
+      ZBX_SERVER_HOST: zabbix-server
+      ZBX_SERVER_PORT: "10051"
+    networks:
+      - zops-net
+
+  # ---------- 业务后端 FastAPI (Phase 1 仅 /health) ----------
+  backend:
+    build:
+      context: ./backend
+    container_name: zops-backend
+    restart: unless-stopped
+    depends_on:
+      zabbix-web:
+        condition: service_started
+    environment:
+      APP_ENV: ${APP_ENV:-production}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      DATABASE_URL: ${DATABASE_URL:-sqlite:///./data/app.db}
+      ZABBIX_URL: http://zabbix-web:8080
+      # ---- Phase 5: Zabbix API (密码只在 Ubuntu 侧 .env, 不进仓库/聊天记录) ----
+      ZABBIX_API_URL: ${ZABBIX_API_URL:-http://zabbix-web:8080/api_jsonrpc.php}
+      ZABBIX_USERNAME: ${ZABBIX_USERNAME:-Admin}
+      ZABBIX_PASSWORD: ${ZABBIX_PASSWORD:-}
+      ZABBIX_SYNC_INTERVAL: ${ZABBIX_SYNC_INTERVAL:-60}
+      ZABBIX_SYNC_DAYS: ${ZABBIX_SYNC_DAYS:-30}
+      # ---- Phase 9: LLM (Key 只在 Ubuntu 侧 .env, 不进仓库/聊天记录/镜像层) ----
+      LLM_BASE_URL: ${LLM_BASE_URL:-}
+      LLM_API_KEY: ${LLM_API_KEY:-}
+      LLM_MODEL: ${LLM_MODEL:-}
+      LLM_TIMEOUT: ${LLM_TIMEOUT:-120}
+      # ---- Phase 10: Agent 工具循环上限 (防失控) ----
+      LLM_AGENT_MAX_ROUNDS: ${LLM_AGENT_MAX_ROUNDS:-6}
+      # ---- Phase 12: AI 自动故障分析调度 ----
+      AI_AUTO_ENABLED: ${AI_AUTO_ENABLED:-true}
+      AI_AUTO_INTERVAL: ${AI_AUTO_INTERVAL:-60}
+      AI_AUTO_MAX_PER_TICK: ${AI_AUTO_MAX_PER_TICK:-3}
+      # ---- Phase 13: 人工确认 + 安全执行 (容器名白名单; AI 无执行路径) ----
+      EXEC_ENABLED: ${EXEC_ENABLED:-true}
+      EXEC_AUTO_SUGGEST: ${EXEC_AUTO_SUGGEST:-true}
+      EXEC_ALLOW_TARGETS: ${EXEC_ALLOW_TARGETS:-zops-drill}
+      EXEC_DOCKER_SOCKET: ${EXEC_DOCKER_SOCKET:-/var/run/docker.sock}
+      EXEC_TIMEOUT: ${EXEC_TIMEOUT:-30}
+      # ---- Phase 14: 审计日志 (sha256 哈希链, 只追加; false 只停写入) ----
+      AUDIT_ENABLED: ${AUDIT_ENABLED:-true}
+    volumes:
+      - backend_data:/app/data
+      # Phase 13: Docker Engine API socket —— 受控执行通道。
+      # 风险须知: 拿到 socket≈宿主机 root, 因此代码层三重收紧:
+      # 目标白名单(EXEC_ALLOW_TARGETS) + 动作固定集合(restart/start/stop)
+      # + 必须人工审批; 不想要这条通道就删掉本行 (后端会诚实报
+      # socket_exists=false, 批准接口 503, 一切照跑只是不能执行)。
+      - ${DOCKER_SOCKET_PATH:-/var/run/docker.sock}:/var/run/docker.sock
+    # Phase 13: 镜像内 uvicorn 跑在非 root 的 zops 用户, 而宿主机
+    # docker.sock 属 root:docker —— 把宿主 docker 组的 GID 补进容器附属组,
+    # 最小授权 (不给 root, 不 chown socket)。值来自 .env:
+    #   DOCKER_GID=$(stat -c '%g' /var/run/docker.sock)
+    group_add:
+      - "${DOCKER_GID:-999}"
+    ports:
+      - "${BACKEND_PORT:-8000}:8000"
+    networks:
+      - zops-net
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=3)\""]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+
+networks:
+  zops-net:
+    driver: bridge
+
+volumes:
+  zabbix_pg_data:
+  zabbix_server_data:
+  backend_data:
